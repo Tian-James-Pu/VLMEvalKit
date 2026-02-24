@@ -28,15 +28,18 @@ def _is_url(p: str) -> bool:
     u = urlparse(p)
     return u.scheme in ("http", "https", "s3", "gs", "data", "file")
 
-def _norm_local(p: str) -> str:
-    return os.path.abspath(os.path.expanduser(p))
+def _norm_relative(p: str, base: str = None) -> str:
+    """Resolve path to absolute; if base is given, treat non-absolute p as relative to base."""
+    if base is not None and not osp.isabs(p):
+        return osp.normpath(osp.join(base, p))
+    return osp.abspath(osp.expanduser(p))
 
 def _to_data_url_from_base64(b64_str: str) -> str:
     """Convert a base64 string to a data URL. Assumes PNG format."""
     return f"data:image/png;base64,{b64_str}"
 
 def _to_data_url(p: str) -> str:
-    """Convert a local file path to a data URL."""
+    """Convert a relative or absolute file path to a data URL."""
     import mimetypes
     mime_type, _ = mimetypes.guess_type(p)
     if mime_type is None:
@@ -49,14 +52,14 @@ def _to_image_part(p: str) -> dict:
     """
     Return an OpenAI-compatible image content part.
     - URLs (http/https/s3/gs/data/file) are passed through.
-    - Local filesystem paths are converted to data URLs.
+    - Relative or absolute filesystem paths are converted to data URLs.
     """
     if not p:
         return {}
     if _is_url(p):
         # pass through as URL (OpenAI supports http/https/data/file)
         return {"type": "image_url", "image_url": {"url": p}}
-    p_abs = _norm_local(p)
+    p_abs = _norm_relative(p)
     return {"type": "image_url", "image_url": {"url": _to_data_url(p_abs)}}
 
 def _has_text(x) -> bool:
@@ -67,7 +70,7 @@ def _has_text(x) -> bool:
 # CLEVR VQA Evaluation Utilities
 # ============================================================================
 
-def _normalize_clevr_answer(answer):
+def _normalize_aclevr_answer(answer):
     """
     Normalize answer according to CLEVR VQA evaluation rules.
     
@@ -134,7 +137,7 @@ def _process_clevr_line(line):
     pred = line['prediction']
     
     # Normalize ground truth
-    gt_normalized = _normalize_clevr_answer(gt)
+    gt_normalized = _normalize_aclevr_answer(gt)
     
     # Normalize prediction
     pred_normalized = _normalize_clevr_prediction(pred)
@@ -320,39 +323,12 @@ class UniQA3DRelPose(ImageMCQDataset):
             tsv_path = data if data is not None else kwargs.pop("data", None)
             rest_pos = ()
         
-        # If no path provided, try default locations or use default URL
+        # If no path provided, use HuggingFace URL (always download, no local fallbacks)
         if not tsv_path:
-            # If dataset_name was provided (e.g., "UniQA3D_RELPOSE"), use it to find the file
-            if dataset_name and dataset_name in self.SUPPORTED_DATASETS:
-                # Try default local location first
-                default_path = "/Users/tianpu/Desktop/Coding/Princeton/JiaLab/Karhan/relative_camera_pose.tsv"
-                if osp.exists(default_path):
-                    tsv_path = default_path
-                else:
-                    # Try in LMU data root
-                    data_root = LMUDataRoot()
-                    potential_path = osp.join(data_root, f"{dataset_name}.tsv")
-                    if osp.exists(potential_path):
-                        tsv_path = potential_path
-                    else:
-                        # Try relative_camera_pose.tsv in data root
-                        potential_path = osp.join(data_root, "relative_camera_pose.tsv")
-                        if osp.exists(potential_path):
-                            tsv_path = potential_path
-                        else:
-                            # Use default URL
-                            tsv_path = self.DEFAULT_TSV_URL
-            else:
-                # No dataset name, try default local location
-                default_path = "/Users/tianpu/Desktop/Coding/Princeton/JiaLab/Karhan/relative_camera_pose.tsv"
-                if osp.exists(default_path):
-                    tsv_path = default_path
-                else:
-                    # Use default URL
-                    tsv_path = self.DEFAULT_TSV_URL
-        
+            tsv_path = self.DEFAULT_TSV_URL
+
         if not tsv_path:
-            raise ValueError("UniQA3DRelPose requires the TSV path as first arg, data=<path>, or dataset=<name> with file in default location.")
+            raise ValueError("UniQA3DRelPose requires the TSV path as first arg or data=<url>. Default is HuggingFace URL.")
 
         # normalize accidental double extension
         if isinstance(tsv_path, str) and tsv_path.endswith(".tsv.tsv") and os.path.exists(tsv_path[:-4]):
@@ -363,10 +339,13 @@ class UniQA3DRelPose(ImageMCQDataset):
 
         self.require_split = (require_split or "").strip().lower() or None
 
-        if osp.isfile(tsv_path):
-            self.dataset_name = self.SUPPORTED_DATASETS[0]
-            root = LMUDataRoot()
-            self.img_root = osp.join(root, 'images', img_root_map(self.dataset_name))
+        # Use the requested dataset name so inference writes to the same path run.py expects
+        self.dataset_name = (
+            dataset_name if (dataset_name and dataset_name in self.SUPPORTED_DATASETS)
+            else self.SUPPORTED_DATASETS[0]
+        )
+        root = LMUDataRoot()
+        self.img_root = osp.join(root, 'images', img_root_map(self.dataset_name))
 
         if isinstance(self.data, pd.DataFrame):
             for col in ["image_path", "image_path_2", "question", "answer", "split", "category"]:
@@ -390,40 +369,28 @@ class UniQA3DRelPose(ImageMCQDataset):
                     # If dataset is smaller than limit, process all
                     print(f"Processing all {len(self.data)} samples (UNIQA_N={n_limit} but dataset has fewer samples)")
 
-    # Load data: handle local files, URLs, or use parent's load_data
+    # Load data: URL only (always download from HuggingFace)
     def load_data(self, dataset):
         ds = str(dataset)
-
-        # Normalize file:// → local path
-        if ds.startswith("file://"):
-            ds = unquote(urlparse(ds).path)
 
         # accidental ".tsv.tsv"
         if ds.endswith(".tsv.tsv") and os.path.exists(ds[:-4]):
             ds = ds[:-4]
 
-        ds_exp = os.path.abspath(os.path.expanduser(ds))
-        if os.path.exists(ds_exp):
-            # Local file exists, load directly
-            return pd.read_csv(ds_exp, sep="\t", dtype=str).fillna("")
-
-        # Check if it's a URL (http/https)
+        # URL (http/https): always download from HuggingFace
         parsed = urlparse(ds)
         if parsed.scheme in ("http", "https"):
             data_root = LMUDataRoot()
             os.makedirs(data_root, exist_ok=True)
-            # Use DEFAULT_TSV_FILENAME if defined, otherwise default to "relative_camera_pose.tsv"
             file_name = getattr(self, 'DEFAULT_TSV_FILENAME', 'relative_camera_pose.tsv')
             data_path = osp.join(data_root, file_name)
-            
-            # Download if not exists
-            if not osp.exists(data_path):
-                download_file(ds, data_path)
-            
-            # Load the TSV file using standard load function
+            download_file(ds, data_path)
             return load(data_path)
 
-        # not local and not URL → let parent handle (download/registry/etc.)
+        # Explicit data=<path> from caller (e.g. unit test)
+        ds_exp = osp.abspath(osp.expanduser(ds))
+        if os.path.exists(ds_exp):
+            return pd.read_csv(ds_exp, sep="\t", dtype=str).fillna("")
         return super().load_data(dataset)
 
     def build_prompt(self, line):
@@ -433,9 +400,10 @@ class UniQA3DRelPose(ImageMCQDataset):
         else:
             row = line
 
-        img1 = (row.get("image_path") or row.get("image1") or "").strip()
-        img2 = (row.get("image_path_2") or row.get("image2") or "").strip()
-        q    = (row.get("question") or "").strip()
+        # First, dump images to handle base64/data URLs - this returns processed file paths
+        tgt_paths = self.dump_image(line)
+        
+        q = (row.get("question") or "").strip()
 
         letters = _letters_present_in_row(row)
         prompt = f"Question: {q}\n"
@@ -452,16 +420,25 @@ class UniQA3DRelPose(ImageMCQDataset):
 
         # Return VLMEvalKit format: dict(type='image', value=path) and dict(type='text', value=prompt)
         msgs = []
-        if _has_text(img1):
-            # Handle relative paths by joining with img_root if needed
-            if not _is_url(img1) and not osp.isabs(img1):
-                img1 = osp.join(self.img_root, img1) if hasattr(self, 'img_root') else _norm_local(img1)
-            msgs.append(dict(type='image', value=img1))
-        if _has_text(img2):
-            # Handle relative paths by joining with img_root if needed
-            if not _is_url(img2) and not osp.isabs(img2):
-                img2 = osp.join(self.img_root, img2) if hasattr(self, 'img_root') else _norm_local(img2)
-            msgs.append(dict(type='image', value=img2))
+        # Use the processed paths from dump_image
+        if isinstance(tgt_paths, list) and len(tgt_paths) >= 2:
+            msgs.append(dict(type='image', value=tgt_paths[0]))
+            msgs.append(dict(type='image', value=tgt_paths[1]))
+        elif isinstance(tgt_paths, list) and len(tgt_paths) == 1:
+            msgs.append(dict(type='image', value=tgt_paths[0]))
+        else:
+            # Fallback: use raw paths (shouldn't happen if dump_image works correctly)
+            img1 = (row.get("image_path") or row.get("image1") or "").strip()
+            img2 = (row.get("image_path_2") or row.get("image2") or "").strip()
+            if _has_text(img1):
+                if not _is_url(img1) and not osp.isabs(img1):
+                    img1 = osp.join(self.img_root, img1) if hasattr(self, 'img_root') else _norm_relative(img1)
+                msgs.append(dict(type='image', value=img1))
+            if _has_text(img2):
+                if not _is_url(img2) and not osp.isabs(img2):
+                    img2 = osp.join(self.img_root, img2) if hasattr(self, 'img_root') else _norm_relative(img2)
+                msgs.append(dict(type='image', value=img2))
+        
         msgs.append(dict(type='text', value=prompt))
         return msgs
 
@@ -596,7 +573,7 @@ class UniQA3DRelPose(ImageMCQDataset):
             else:
                 # Regular file path or URL
                 if not _is_url(img_path) and not osp.isabs(img_path):
-                    img_path = osp.join(self.img_root, img_path) if hasattr(self, 'img_root') else _norm_local(img_path)
+                    img_path = osp.join(self.img_root, img_path) if hasattr(self, 'img_root') else _norm_relative(img_path)
                 return img_path, None
             
             # Decode base64 to file
@@ -642,15 +619,15 @@ class UniQA3DRelDepth(ImageMCQDataset):
       (optional) split : e.g., 'normal', 'flipud'
     
     This class can be inherited to create variants (e.g., flipped versions) by overriding:
-    - DEFAULT_TSV_URL: The URL or local path to the TSV file
+    - DEFAULT_TSV_URL: HuggingFace URL for the TSV (always downloaded)
     - SUPPORTED_DATASETS: List of dataset names that identify this variant
-    - DEFAULT_TSV_FILENAME: Local filename to save the downloaded TSV (default: "relative_depth.tsv")
+    - DEFAULT_TSV_FILENAME: Relative filename to save the downloaded TSV (default: "relative_depth.tsv")
     """
 
     TYPE = "MCQ"
 
-    SUPPORTED_DATASETS = ["UniQA3D_DEPTH", "relative_depth"]
-    DEFAULT_TSV_URL = "https://drive.google.com/uc?export=download&id=18YreBvBZgwMdmVy3Ein9YSbX8RmqcbKo"
+    SUPPORTED_DATASETS = ["UniQA3D_DEPTH", "UniQA3D_RELATIVE_DEPTHS", "relative_depth", "relative_depths"]
+    DEFAULT_TSV_URL = "https://huggingface.co/TP03/UniQA3D_Dataset/resolve/main/relative_depth.tsv"
     DEFAULT_TSV_FILENAME = "relative_depth.tsv"
 
     @classmethod
@@ -681,8 +658,11 @@ class UniQA3DRelDepth(ImageMCQDataset):
 
         self.require_split = (require_split or "").strip().lower() or None
 
-        # Always set dataset_name and img_root
-        self.dataset_name = self.SUPPORTED_DATASETS[0]
+        # Use the requested dataset name so inference writes to the same path run.py expects
+        self.dataset_name = (
+            dataset_name if (dataset_name and dataset_name in self.SUPPORTED_DATASETS)
+            else self.SUPPORTED_DATASETS[0]
+        )
         root = LMUDataRoot()
         self.img_root = osp.join(root, 'images', img_root_map(self.dataset_name))
         # Ensure img_root directory exists
@@ -714,27 +694,23 @@ class UniQA3DRelDepth(ImageMCQDataset):
     def load_data(self, dataset):
         ds = str(dataset)
 
-        if ds.startswith("file://"):
-            ds = unquote(urlparse(ds).path)
-
         if ds.endswith(".tsv.tsv") and os.path.exists(ds[:-4]):
             ds = ds[:-4]
 
-        ds_exp = os.path.abspath(os.path.expanduser(ds))
-        if os.path.exists(ds_exp):
-            data = pd.read_csv(ds_exp, sep="\t", dtype=str).fillna("")
+        # URL (http/https): always download from HuggingFace
+        parsed = urlparse(ds)
+        if parsed.scheme in ("http", "https"):
+            data_root = LMUDataRoot()
+            os.makedirs(data_root, exist_ok=True)
+            file_name = getattr(self, "DEFAULT_TSV_FILENAME", "relative_depth.tsv")
+            data_path = osp.join(data_root, file_name)
+            download_file(ds, data_path)
+            data = load(data_path)
         else:
-            parsed = urlparse(ds)
-            if parsed.scheme in ("http", "https"):
-                data_root = LMUDataRoot()
-                os.makedirs(data_root, exist_ok=True)
-                file_name = "relative_depth.tsv"
-                data_path = osp.join(data_root, file_name)
-                
-                if not osp.exists(data_path):
-                    download_file(ds, data_path)
-                
-                data = load(data_path)
+            # Explicit data=<path> from caller (e.g. unit test); run.py never passes this
+            ds_exp = osp.abspath(osp.expanduser(ds))
+            if os.path.exists(ds_exp):
+                data = pd.read_csv(ds_exp, sep="\t", dtype=str).fillna("")
             else:
                 data = super().load_data(dataset)
         
@@ -766,7 +742,7 @@ class UniQA3DRelDepth(ImageMCQDataset):
             elif len(img) > 100 and not _is_url(img) and not osp.isabs(img) and not osp.exists(img):
                 img = _to_data_url_from_base64(img)
             elif not _is_url(img) and not osp.isabs(img):
-                img = osp.join(self.img_root, img) if hasattr(self, 'img_root') else _norm_local(img)
+                img = osp.join(self.img_root, img) if hasattr(self, 'img_root') else _norm_relative(img)
             msgs.append(dict(type='image', value=img))
         msgs.append(dict(type='text', value=prompt))
         return msgs
@@ -880,18 +856,48 @@ class UniQA3DRelPoseFlipped(UniQA3DRelPose):
 class UniQA3DRelDepthFlipped(UniQA3DRelDepth):
     """
     Flipped version of UniQA-3D Relative Depth.
-    
-    TODO: Update DEFAULT_TSV_URL with the actual flipped dataset URL when available.
     """
-    SUPPORTED_DATASETS = ["UniQA3D_DEPTH_FLIPPED", "relative_depth_flipped"]
-    DEFAULT_TSV_URL = "https://drive.google.com/uc?export=download&id=1Bu29zfcK-VoIcDC0xi6HvJUkMHcqn5iS"
+    SUPPORTED_DATASETS = ["UniQA3D_DEPTH_FLIPPED", "UniQA3D_RELATIVE_DEPTHS_FLIPPED", "relative_depth_flipped", "relative_depths_flipped"]
+    DEFAULT_TSV_URL = "https://huggingface.co/TP03/UniQA3D_Dataset/resolve/main/relative_depth_flipped.tsv"
     DEFAULT_TSV_FILENAME = "relative_depth_flipped.tsv"
-    
-    def __init__(self, *args, **kwargs):
-        if self.DEFAULT_TSV_URL == "TODO_REPLACE_WITH_FLIPPED_RELDEPTH_URL":
-            raise ValueError(
-                "UniQA3DRelDepthFlipped requires DEFAULT_TSV_URL to be set. "
-                "Please update DEFAULT_TSV_URL in uniqa3d.py with the actual flipped dataset URL, "
-                "or pass data=<path> when creating the dataset."
-            )
-        super().__init__(*args, **kwargs)
+
+
+# Ensure UniQA3D classes are registered when the dataset module has finished loading (works even if
+# vlmeval/dataset/__init__.py is an older version that did not add them to IMAGE_DATASET).
+def _register_uniqa3d_if_needed():
+    import sys
+    parent = sys.modules.get('vlmeval.dataset')
+    if parent is None or not hasattr(parent, 'IMAGE_DATASET'):
+        return
+    _classes = (UniQA3DClevrVQA, UniQA3DRelPose, UniQA3DRelDepth, UniQA3DRelPoseFlipped, UniQA3DRelDepthFlipped)
+    names = [c.__name__ for c in parent.IMAGE_DATASET]
+    to_add = [c for c in _classes if c.__name__ not in names]
+    if not to_add:
+        return
+    parent.IMAGE_DATASET = list(parent.IMAGE_DATASET) + to_add
+    parent.DATASET_CLASSES = (
+        parent.IMAGE_DATASET + parent.VIDEO_DATASET + parent.TEXT_DATASET
+        + parent.CUSTOM_DATASET + parent.DATASET_COLLECTION
+    )
+    parent.SUPPORTED_DATASETS = []
+    for cls in parent.DATASET_CLASSES:
+        parent.SUPPORTED_DATASETS.extend(cls.supported_datasets())
+
+
+def _delayed_register():
+    import time
+    time.sleep(0.15)
+    _register_uniqa3d_if_needed()
+
+
+def _wrap_build_dataset():
+    import sys
+    import threading
+    parent = sys.modules.get('vlmeval.dataset')
+    if parent is None:
+        return
+    # Run registration after parent module has finished loading (IMAGE_DATASET, build_dataset, etc.)
+    threading.Thread(target=_delayed_register, daemon=True).start()
+
+
+_wrap_build_dataset()
