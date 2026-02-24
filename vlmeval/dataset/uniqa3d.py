@@ -847,10 +847,17 @@ class UniQA3DRelDepth(ImageMCQDataset):
 class UniQA3DRelPoseFlipped(UniQA3DRelPose):
     """
     Flipped version of UniQA-3D Relative Camera Pose (rot180).
+    Same logic as RelPose; only the TSV URL/filename differ. Uses the same image directory as RelPose.
     """
     SUPPORTED_DATASETS = ["UniQA3D_RELPOSE_FLIPPED", "relative_camera_pose_flipped"]
     DEFAULT_TSV_URL = "https://huggingface.co/TP03/UniQA3D_Dataset/resolve/main/relative_camera_pose_rot180.tsv"
     DEFAULT_TSV_FILENAME = "relative_camera_pose_flipped.tsv"
+
+    def __init__(self, data=None, *args, require_split=None, **kwargs):
+        super().__init__(data=data, *args, require_split=require_split, **kwargs)
+        # Use same image root as non-flipped RelPose (images are in the same folder)
+        root = LMUDataRoot()
+        self.img_root = osp.join(root, 'images', img_root_map('UniQA3D_RELPOSE'))
 
 
 class UniQA3DRelDepthFlipped(UniQA3DRelDepth):
